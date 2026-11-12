@@ -1,0 +1,87 @@
+name: Disposable permission checks
+on:
+  push:
+    branches: [feature/hosted-permission-checks, main]
+    tags: [fixture-app-release]
+  pull_request:
+  workflow_dispatch:
+    inputs:
+      check:
+        type: choice
+        required: true
+        options: [environment, writer, reader]
+permissions: {}
+# Install only in the named disposable repository. The jobs use its own ephemeral token.
+jobs:
+  naming:
+    name: branch-naming
+    if: github.repository == 'test-upside/release-permission-fixture-20261112' && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Check the synthetic contribution branch
+        env:
+          SOURCE_BRANCH: ${{ github.head_ref }}
+        run: '[[ "$SOURCE_BRANCH" == feature/* ]]'
+  fixture:
+    name: test
+    if: github.repository == 'test-upside/release-permission-fixture-20261112' && github.event_name == 'pull_request'
+    runs-on: ubuntu-24.04
+    steps:
+      - run: echo "Synthetic fixture check passed."
+  environment:
+    if: github.repository == 'test-upside/release-permission-fixture-20261112' && ((github.event_name == 'workflow_dispatch' && inputs.check == 'environment') || (github.event_name == 'push'))
+    runs-on: ubuntu-24.04
+    environment: governance-relay
+    steps:
+      - run: echo "GitHub admitted this ref to the empty fixture environment."
+  reader:
+    if: github.repository == 'test-upside/release-permission-fixture-20261112' && ((github.event_name == 'workflow_dispatch' && inputs.check == 'reader' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == 'refs/heads/feature/hosted-permission-checks'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: read
+    steps:
+      - name: Read refs and request a fixture draft
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          gh api repos/test-upside/release-permission-fixture-20261112/git/ref/heads/main --jq .object.sha
+          code=$(curl -sS -o "$RUNNER_TEMP/result" -w '%{http_code}' -X POST -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' --json '{"tag_name":"fixture-reader","name":"Read permission check","draft":true}' https://api.github.com/repos/test-upside/release-permission-fixture-20261112/releases)
+          echo "read-only identity draft HTTP $code" | tee -a "$GITHUB_STEP_SUMMARY"
+          test "$code" = 403
+  writer:
+    if: github.repository == 'test-upside/release-permission-fixture-20261112' && ((github.event_name == 'workflow_dispatch' && inputs.check == 'writer' && github.ref == 'refs/heads/main') || (github.event_name == 'push' && github.ref == 'refs/heads/feature/hosted-permission-checks'))
+    runs-on: ubuntu-24.04
+    permissions:
+      contents: write
+    steps:
+      - name: Measure repository write permissions on synthetic objects
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -eu
+          base=https://api.github.com/repos/test-upside/release-permission-fixture-20261112
+          response="$RUNNER_TEMP/response"
+          call() {
+            status=$(curl -sS -o "$response" -w '%{http_code}' -X "$1" -H "Authorization: Bearer $GH_TOKEN" -H 'Accept: application/vnd.github+json' --json "$3" "$base/$2")
+            printf '%s\t%s\t%s\n' "$4" "$status" "$(jq -cr '{message,id,sha:.object.sha,draft,immutable} | with_entries(select(.value != null))' "$response")" | tee -a "$GITHUB_STEP_SUMMARY"
+          }
+          control="feature/writer-control-${GITHUB_RUN_ID}-${GITHUB_RUN_ATTEMPT}"
+          parent=$(gh api repos/test-upside/release-permission-fixture-20261112/git/ref/heads/main --jq .object.sha)
+          call POST git/refs "$(jq -nc --arg ref "refs/heads/$control" --arg sha "$parent" '{ref:$ref,sha:$sha}')" unprotected-branch-create
+          test "$status" = 201
+          candidate=$(gh api -X PUT repos/test-upside/release-permission-fixture-20261112/contents/writer-control.txt -f branch="$control" -f message='Synthetic write permission control' -f content=Zml4dHVyZQo= --jq .commit.sha)
+          call PATCH git/refs/heads/main "$(jq -nc --arg sha "$candidate" '{sha:$sha,force:false}')" protected-main-update
+          case "$status" in 403|422) ;; *) exit 1;; esac
+          call POST git/refs "$(jq -nc --arg sha "$candidate" '{ref:"refs/tags/fixture-writer-new",sha:$sha}')" restricted-tag-create
+          case "$status" in 403|422) ;; *) exit 1;; esac
+          call PATCH git/refs/tags/fixture-tag-control "$(jq -nc --arg sha "$candidate" '{sha:$sha,force:false}')" protected-tag-update
+          case "$status" in 403|422) ;; *) exit 1;; esac
+          call POST releases '{"tag_name":"fixture-publication","name":"Synthetic permission measurement","body":"Disposable fixture only.","draft":true,"make_latest":"false"}' existing-tag-draft
+          if [ "$status" = 201 ]; then
+            id=$(jq -er .id "$response")
+            call PATCH "releases/$id" '{"draft":false,"make_latest":"false"}' existing-tag-publish
+            case "$status" in 200|403|422) ;; *) exit 1;; esac
+          else
+            case "$status" in 403|422) ;; *) exit 1;; esac
+          fi
